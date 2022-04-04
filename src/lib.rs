@@ -1,13 +1,14 @@
 //! A library for catching panic.
 
 #![feature(alloc_error_hook)]
+#![feature(allocator_api)]
 
 use std::alloc::Layout;
 use std::cell::Cell;
 use std::error::Error;
 use std::fmt;
-use std::panic::UnwindSafe;
-use std::sync::Once;
+use std::panic::{PanicInfo, UnwindSafe};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The error type for allocation failure.
 #[derive(Copy, Clone)]
@@ -101,17 +102,22 @@ fn oom_hook(layout: Layout) {
 /// process will abort if other panics occur.
 #[inline]
 pub fn catch_oom<F: FnOnce() -> R + UnwindSafe, R>(f: F) -> Result<R, AllocError> {
-    static SET_HOOK: Once = Once::new();
-    SET_HOOK.call_once_force(|_| {
-        std::alloc::set_alloc_error_hook(oom_hook);
+    type Hook = Box<dyn Fn(&PanicInfo<'_>) + 'static + Sync + Send>;
 
-        std::panic::set_hook(Box::new(|_| {
-            // panic abort except alloc error
-            if !ThreadAllocError::has_error() {
-                std::process::abort();
-            }
-        }));
-    });
+    fn panic_hook(_: &PanicInfo<'_>) {
+        // panic abort except alloc error
+        if !ThreadAllocError::has_error() {
+            std::process::abort();
+        }
+    }
+
+    static SET_HOOK: AtomicBool = AtomicBool::new(false);
+    if !SET_HOOK.load(Ordering::Acquire) {
+        let hook: Hook = Box::try_new(panic_hook).map_err(|_| AllocError::new(Layout::new::<Hook>()))?;
+        std::panic::set_hook(hook);
+        std::alloc::set_alloc_error_hook(oom_hook);
+        SET_HOOK.store(true, Ordering::Release);
+    }
 
     ThreadAllocError::clear();
     let result = std::panic::catch_unwind(f);
